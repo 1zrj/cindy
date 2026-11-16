@@ -25,6 +25,7 @@ function setup(options: { home: string | null; handler?: ApiHandler; devices?: D
   readValues?: () => Promise<Array<{ key: string; value: unknown }>>; syncProfile?: (botId: string) => Promise<void>;
   turnActive?: () => boolean; homeLink?: CompanionCloudHost['homeLink']; stopBotTurns?: CompanionCloudHost['stopBotTurns'];
   canonicalSession?: CompanionCloudHost['canonicalSession']; paused?: (botId: string) => boolean; refreshForeground?: () => Promise<void>;
+  avatarStandIn?: CompanionCloudHost['avatarStandIn']; restoreAvatar?: CompanionCloudHost['restoreAvatar'];
   store?: Parameters<typeof startCompanionCloud>[0]['store']; savedState?: string; upgradeArrived?: CompanionCloudHost['upgradeArrived']; current?: () => boolean }) {
   const actors: CompanionRuntimeActor[] = [{ id: 'actor-1', kind: 'bot', externalId: 'bot_mia', name: 'Mia', avatar: null, homeDeviceId: options.home }];
   const { api, calls } = fakeApi(options.handler ?? ((route, method) => {
@@ -53,6 +54,8 @@ function setup(options: { home: string | null; handler?: ApiHandler; devices?: D
     ...(options.turnActive ? { isBotBusy: async () => options.turnActive!() } : {}),
     ...(options.homeLink ? { homeLink: options.homeLink } : {}),
     ...(options.stopBotTurns ? { stopBotTurns: options.stopBotTurns } : {}),
+    ...(options.avatarStandIn ? { avatarStandIn: options.avatarStandIn } : {}),
+    ...(options.restoreAvatar ? { restoreAvatar: options.restoreAvatar } : {}),
     ...(options.upgradeArrived ? { upgradeArrived: options.upgradeArrived } : {}),
   };
   runtime = startCompanionCloud({ api, ...(options.backgroundIdentityApi ? { backgroundIdentity: {
@@ -700,6 +703,69 @@ describe('reconcile', () => {
     const t = setup({ home: 'desk' });
     t.runtime.reconcile([]);
     await vi.waitFor(() => expect(t.local.host.createProfile).toHaveBeenCalledOnce());
+  });
+});
+
+describe('stand-in avatar recovery', () => {
+  it('adopts the roster avatar of a copy that took over with a stand-in', async () => {
+    const restoreAvatar = vi.fn(async () => undefined);
+    const syncProfile = vi.fn(async () => undefined);
+    const t = setup({ home: 'desk', syncProfile, avatarStandIn: async () => true, restoreAvatar });
+    t.actors[0]!.avatar = 'https://cdn.example/mia.png';
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await vi.waitFor(() => expect(restoreAvatar).toHaveBeenCalledWith('bot_mia', 'https://cdn.example/mia.png', expect.anything()));
+    await vi.waitFor(() => expect(syncProfile).toHaveBeenCalledWith('bot_mia'));
+  });
+
+  it('asks a refused avatar again only once its value changed; a transient failure retries', async () => {
+    let failure: Error = new Error('AVATAR_UNRECOVERABLE');
+    const restoreAvatar = vi.fn(async () => { throw failure; });
+    const t = setup({ home: 'desk', avatarStandIn: async () => true, restoreAvatar });
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+    t.actors[0]!.avatar = 'https://cdn.example/dead.png';
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await vi.waitFor(() => expect(restoreAvatar).toHaveBeenCalledOnce());
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await settle();
+    expect(restoreAvatar).toHaveBeenCalledOnce();
+    failure = new Error('AVATAR_UNAVAILABLE');
+    t.actors[0]!.avatar = 'https://cdn.example/slow.png';
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await vi.waitFor(() => expect(restoreAvatar).toHaveBeenCalledTimes(2));
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await vi.waitFor(() => expect(restoreAvatar).toHaveBeenCalledTimes(3));
+    failure = new Error('AVATAR_UNRECOVERABLE');
+    t.actors[0]!.avatar = 'https://cdn.example/fresh.png';
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await vi.waitFor(() => expect(restoreAvatar).toHaveBeenCalledTimes(4));
+    expect(restoreAvatar).toHaveBeenLastCalledWith('bot_mia', 'https://cdn.example/fresh.png', expect.anything());
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await settle();
+    expect(restoreAvatar).toHaveBeenCalledTimes(4);
+  });
+
+  const leaveAlone: Array<[name: string, standIn: () => Promise<boolean>, avatar: string | null, home: string]> = [
+    ['no stand-in provenance', async () => false, 'https://cdn.example/mia.png', 'desk'],
+    ['no roster avatar', async () => true, null, 'desk'],
+    ['homed elsewhere', async () => true, 'https://cdn.example/mia.png', 'laptop'],
+  ];
+  it.each(leaveAlone)('leaves a copy alone with %s', async (_name, standIn, avatar, home) => {
+    const restoreAvatar = vi.fn(async () => undefined);
+    const t = setup({ home, avatarStandIn: standIn, restoreAvatar });
+    t.actors[0]!.avatar = avatar;
+    t.runtime.reconcile([{ id: 'bot_mia', status: 'active' }]);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(restoreAvatar).not.toHaveBeenCalled();
+  });
+
+
+  it('re-reads a roster without an avatar before an explicit take-over', async () => {
+    let t!: ReturnType<typeof setup>;
+    const refreshForeground = vi.fn(async () => { t.actors[0]!.avatar = 'https://cdn.example/mia.png'; });
+    t = setup({ home: 'laptop', refreshForeground });
+    expect(await t.runtime.takeOver('bot_mia')).toEqual({ ok: true });
+    expect(refreshForeground).toHaveBeenCalled();
+    expect(t.local.host.createProfile).toHaveBeenCalledWith(expect.objectContaining({ avatar: 'https://cdn.example/mia.png' }), expect.anything());
   });
 });
 

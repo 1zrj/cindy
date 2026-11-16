@@ -525,6 +525,30 @@ export function createCompanionCloudHost(input: {
     deliverToCanonical: input.deliverToCanonical,
     onLocalChange: onBotRemoteResourceChanged,
     materializer: createMaterializer(input),
+    // a take-over that could not read the cloud image stored a stand-in
+    // default; the runtime adopts the real avatar once the roster has one again.
+    avatarStandIn: async botId => {
+      const [row] = await getDbClient().drizzle
+        .select({ status: botProfiles.status, config: botProfileVersions.capabilitiesJson })
+        .from(botProfiles).innerJoin(botProfileVersions,
+          and(eq(botProfileVersions.botId, botProfiles.id), eq(botProfileVersions.version, botProfiles.currentVersion)))
+        .where(eq(botProfiles.id, botId)).limit(1);
+      return !!row && row.status === 'active' && JSON.parse(row.config ?? '{}').cloudAvatarFallback === true;
+    },
+    restoreAvatar: async (botId, avatar, fence) => {
+      const restored = await restoreCloudAvatar(avatar, fence.signal);
+      fence.assertCurrent();
+      if ('imageBase64' in restored) {
+        const image = decodeBotAvatarImage(restored.imageBase64);
+        fence.assertCurrent();
+        // A real image clears the stand-in provenance atomically (setBotProfileAvatar).
+        if (image) await setBotProfileAvatar(botId, image);
+        return;
+      }
+      // The value itself is unusable (not a fetch that may recover): only a changed one is asked again.
+      if (restored.fallback) throw new Error('AVATAR_UNRECOVERABLE');
+      await updateBotProfile({ id: botId, avatar: restored.portable }, undefined, undefined, { avatarFallback: false });
+    },
     upgradeArrived: upgradeArrivedTeammate,
     listDevices: input.listDevices,
     ...(input.isTurnActive ? { isBotBusy: async (botId: string) =>

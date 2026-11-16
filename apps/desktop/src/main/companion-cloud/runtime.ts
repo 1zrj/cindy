@@ -54,6 +54,13 @@ export interface CompanionCloudHost {
   onLocalChange?: (listener: (botId: string) => void) => () => void;
   /** Local side of taking a companion over; absent disables take-over and auto-materialize. */
   materializer?: Omit<CompanionMaterializeHost, 'latestRows'>;
+  /** The local profile still shows the stand-in avatar a take-over stored (cloud-companions.md §6). */
+  avatarStandIn?: (botId: string) => Promise<boolean>;
+  /**
+   * Adopt the companion's cloud avatar into the local profile, clearing the stand-in provenance.
+   * `AVATAR_UNAVAILABLE` may still succeed later; any other refusal stands until the value changes.
+   */
+  restoreAvatar?: (botId: string, avatar: string, fence: CompanionWriteFence) => Promise<void>;
   /** Current-home repair edits only the rejected sources, with a fresh local source/version check. */
   repairProfileSources?: (botId: string, fields: CompanionProfileRepairField[], values: ProfileCorrection['values'], fence: CompanionWriteFence) => Promise<void>;
   /**
@@ -667,6 +674,43 @@ export function startCompanionCloud(input: {
     }).finally(() => { autoPending.delete(botId); });
   }
 
+  /** One stand-in avatar recovery per companion at a time; a refused value waits for a different one. */
+  const avatarRecovering = new Set<string>();
+  const avatarRefused = new Map<string, string>();
+
+  /**
+   * A take-over that could not read the cloud avatar left a stand-in default. 
+   * Once the roster shows an avatar again — published after the move, or missed by the
+   * stale roster the take-over read — the home copy adopts it silently and publishes it. A value
+   * that was refused for good is only asked again after it changed; a temporary failure retries on
+   * the next reconcile.
+   */
+  function recoverStandInAvatar(actor: CompanionRuntimeActor) {
+    const botId = actor.externalId;
+    const avatar = actor.avatar;
+    if (!avatar || !input.host.avatarStandIn || !input.host.restoreAvatar || avatarRecovering.has(botId)) return;
+    if (avatarRefused.get(botId) === avatar) return;
+    avatarRecovering.add(botId);
+    void (async () => {
+      try {
+        if (!await input.host.avatarStandIn!(botId)) return;
+        fence.assertCurrent();
+        // Still this installation's running copy: a demoted or moved companion is not ours to rewrite.
+        const current = actorOf(botId);
+        if (current?.id !== actor.id || current.homeDeviceId !== input.selfDeviceId || state.isDemoted(botId)
+          || installOwner(botId) !== 'mine' || input.paused?.(botId)) return;
+        await input.host.restoreAvatar!(botId, avatar, fence);
+        avatarRefused.delete(botId);
+        input.log?.info?.('Companion avatar recovered from the cloud', { actorId: actor.id });
+        // The copy now holds the real image: publish it, as the take-over could not.
+        void input.syncProfile?.(botId).catch(() => undefined);
+      } catch (error) {
+        if (errorCode(error) !== 'AVATAR_UNAVAILABLE') avatarRefused.set(botId, avatar);
+        input.log?.warn('Companion avatar recovery will retry', { actorId: actor.id, code: errorCode(error) });
+      } finally { avatarRecovering.delete(botId); }
+    })();
+  }
+
   /** Retire only from the installation that may run it: another Cindy on this computer may own it. */
   async function retireOwned(actor: CompanionRuntimeActor, mode: 'foreground' | 'background') {
     const api = mode === 'background' ? backgroundIdentityApi : input.api;
@@ -887,6 +931,7 @@ export function startCompanionCloud(input: {
           continue;
         }
         if (actor.homeDeviceId === self && local && !profileFailures.has(botId)) checkInstall(actor);
+        if (actor.homeDeviceId === self && local && actor.avatar && !entry?.demoted) recoverStandInAvatar(actor);
         if (actor.homeDeviceId && actor.homeDeviceId !== self) {
           identityConflicts.delete(botId);
           if (local && local.status !== 'deleting' && !entry?.demoted) {
@@ -946,8 +991,11 @@ export function startCompanionCloud(input: {
       const self = input.selfDeviceId;
       if (!self || !live() || !input.host.materializer) return { ok: false, code: 'NOT_ENABLED' };
       let actor = actorOf(botId);
-      if (!actor) {
-        try { await refreshForeground?.(); } catch (error) { return homeActionFailure('takeOver', botId, error); }
+      if (!actor?.avatar) {
+        try { await refreshForeground?.(); } catch (error) {
+          if (!actor) return homeActionFailure('takeOver', botId, error);
+          input.log?.warn('Companion take-over used a stale roster for the avatar', { botId, code: errorCode(error) });
+        }
         actor = actorOf(botId);
       }
       if (!actor) return homeActionFailure('takeOver', botId, new Error('COMPANION_NOT_FOUND'));
